@@ -30,7 +30,7 @@ import java.util.zip.GZIPInputStream;
 
 public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytesWritable> {
     public static class ConcatGzipRecordReader extends RecordReader<Text, FileBackedBytesWritable> {
-        static final int BUFFER_SIZE = 8192;
+        static final int BUFFER_SIZE = 2048*1024;
         static final byte FIRST_GZIP_BYTE = (byte) 0x1f;
         static final byte SECOND_GZIP_BYTE = (byte) 0x8b;
 
@@ -104,15 +104,17 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
         private boolean skipToNextRecord(FileBackedOutputStream record) throws IOException {
             byte[] buffer = new byte[BUFFER_SIZE];
             int read;
-            int gzipBytesLocation;
+            int gzipBytesLocation = 0;
             long bytesRead = pos;
             int startOffset;
+            long bytesSaved = 0L;
+            FileBackedOutputStream tmpRecord = new FileBackedOutputStream(BUFFER_SIZE * 2);
 
             if (cache == null) { // pos == start && pos > 0
                 cache = new PushbackInputStream(in, BUFFER_SIZE);
             }
 
-	    /* read until we find a GZIP location or have no more data */
+	        /* read until we find a GZIP location or have no more data */
             do {
                 read = cache.read(buffer);
                 if (read <= 0) {
@@ -123,14 +125,15 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
             /* Save start of the found GZIP stream to set key value later */
             lastRecordOffset = bytesRead - (read - gzipBytesLocation);
             //System.out.println("lastRecOff: " + lastRecordOffset + " bytesRead: " + bytesRead + " pos: " + pos);
-        /* offset of the found GZIP location in the current buffer */
+            /* offset of the found GZIP location in the current buffer */
             startOffset = gzipBytesLocation;
 
-	    /* is there enough data left to look for another GZIP location in the current buffer? */
+	        /* is there enough data left to look for another GZIP location in the current buffer? */
             int from = gzipBytesLocation + 2 < read - 2 ? gzipBytesLocation + 2 : read;
 
             while (read > 0 && (gzipBytesLocation = findAndCheckGZIP(buffer, from, read)) == -1) {
-                record.write(buffer, startOffset, read - startOffset);
+                tmpRecord.write(buffer, startOffset, read - startOffset);
+                bytesSaved += read - startOffset;
                 if (startOffset != 0)
                     startOffset = 0;
                 if (from != 0)
@@ -139,13 +142,22 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
                 bytesRead += read;
             }
 
-	    /* write out the current buffer up to the next GZIP location */
-            record.write(buffer, startOffset, Math.max(0, gzipBytesLocation) - startOffset);
-	    /* accounting, remove the number of bytes read and add number of bytes to the next GZIP location*/
+	        /* write out the current buffer up to the next GZIP location */
+            tmpRecord.write(buffer, startOffset, Math.max(0, gzipBytesLocation) - startOffset);
+            bytesSaved += Math.max(0, gzipBytesLocation) - startOffset;
+	        /* accounting, remove the number of bytes read and add number of bytes to the next GZIP location*/
             bytesRead -= (Math.max(0, read) - Math.max(0, gzipBytesLocation));
             //System.out.println("read: " + read + " gzipBytes: " + gzipBytesLocation + " startOFfset: " + startOffset + " bytesRead: " + bytesRead);
             pos = bytesRead;
             cache.unread(buffer, Math.max(0, gzipBytesLocation), Math.max(0, read) - Math.max(0, gzipBytesLocation));
+
+            /* We do not want files larger than 5MB */
+            if (bytesSaved > 5*1024*1024) {
+                System.err.println("Record too big, skipping...");
+                return skipToNextRecord(record);
+            } else {
+                tmpRecord.asByteSource().copyTo(record);
+            }
 
             return pos <= end;
         }
@@ -183,7 +195,7 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
             /* GZIP header has at least 20 bytes, so use a few more to be on the save side */
             //System.out.println("length: " + length + " offset: " + offset);
             if (length < 512) {
-                buffer = new byte[BUFFER_SIZE / 8];
+                buffer = new byte[2 * 1024];
                 cache.read(buffer);
                 is = new SequenceInputStream(dataStream, new ByteArrayInputStream(buffer));
             } else {
@@ -193,16 +205,22 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
             GZIPInputStream gzip;
             try {
                 gzip = new GZIPInputStream(is);
-                byte[] gzip_buffer = new byte[256];
+                byte[] gzip_buffer = new byte[128];
 
                 /* we only care if there is an exception while reading,
                  * indicating that this is not actually GZIP data */
-                gzip.read(gzip_buffer, 0, 256);
+                gzip.read(gzip_buffer, 0, 128);
 
                 String s = new String(gzip_buffer, "UTF-8");
                 if (this.isWARC && !s.contains("WARC")) {
                     return false;
+                } else {
+                    if (!s.contains("//")) {
+                        return false;
+                    }
                 }
+
+                //System.out.println(s.substring(0, 40));
 
                 //gzip.close();
                 return true;
@@ -210,6 +228,7 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
                 //e.printStackTrace();
                 return false;
             } catch (Exception e) {
+                System.err.println("Exception in ConcatGzipInputFormat checkGzip()");
                 e.printStackTrace();
                 return false;
             } finally {
@@ -231,7 +250,7 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
             if (!hasNext) return false;
 
             try {
-                FileBackedOutputStream record = new FileBackedOutputStream(BUFFER_SIZE * BUFFER_SIZE);
+                FileBackedOutputStream record = new FileBackedOutputStream(BUFFER_SIZE * 2);
                 hasNext = skipToNextRecord(record);
                 key.set(filename + ":" + lastRecordOffset);
                 hasNext = hasNext && pos < end;
@@ -240,6 +259,7 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
                 value.set(record);
             } catch (Exception e) {
                 hasNext = false;
+                System.err.println("Exception in ConcatGzipInputFormat nextKeyValue()");
                 e.printStackTrace();
             }
             return hasNext;
@@ -275,7 +295,7 @@ public class ConcatGzipInputFormat extends FileInputFormat<Text, FileBackedBytes
 
     public static void main(String[] args) throws Exception {
         ConcatGzipRecordReader reader = new ConcatGzipRecordReader();
-        reader.initialize(args[1]);
+        reader.initialize(args[0]);
 
         int count = 0;
         while (reader.nextKeyValue()) {
